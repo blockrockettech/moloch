@@ -1,6 +1,3 @@
-// TODO
-// [ ] Limit whitelisted token count, so a ragequit won't run out of gas.
-
 pragma solidity 0.5.3;
 
 import "./oz/SafeMath.sol";
@@ -13,8 +10,6 @@ contract Moloch is ReentrancyGuard {
     /***************
     GLOBAL CONSTANTS
     ***************/
-    address public summoner; // initial singular shareholder, assists with bailouts
-
     uint256 public periodDuration; // default = 17280 = 4.8 hours in seconds (5 periods per day)
     uint256 public votingPeriodLength; // default = 35 periods (7 days)
     uint256 public gracePeriodLength; // default = 35 periods (7 days)
@@ -138,8 +133,6 @@ contract Moloch is ReentrancyGuard {
         require(_approvedTokens.length > 0, "need at least one approved token");
         require(_proposalDeposit >= _processingReward, "_proposalDeposit cannot be smaller than _processingReward");
 
-        summoner = _summoner;
-
         depositToken = _approvedTokens[0];
 
         for (uint256 i = 0; i < _approvedTokens.length; i++) {
@@ -158,11 +151,11 @@ contract Moloch is ReentrancyGuard {
 
         summoningTime = now;
 
-        members[summoner] = Member(summoner, 1, 0, true, 0, 0);
-        memberAddressByDelegateKey[summoner] = summoner;
+        members[_summoner] = Member(_summoner, 1, 0, true, 0, 0);
+        memberAddressByDelegateKey[_summoner] = _summoner;
         totalShares = 1;
 
-        emit SummonComplete(summoner, 1);
+        emit SummonComplete(_summoner, 1);
     }
 
     /*****************
@@ -186,7 +179,7 @@ contract Moloch is ReentrancyGuard {
 
         // collect tribute from proposer and store it in the Moloch until the proposal is processed
         require(IERC20(tributeToken).transferFrom(msg.sender, address(this), tributeOffered), "tribute token transfer failed");
-        addToBalance(ESCROW, tributeToken, tributeOffered);
+        unsafeAddToBalance(ESCROW, tributeToken, tributeOffered);
 
         bool[6] memory flags; // [sponsored, processed, didPass, cancelled, whitelist, guildkick]
 
@@ -209,7 +202,6 @@ contract Moloch is ReentrancyGuard {
         Member memory member = members[memberToKick];
 
         require(member.shares > 0 || member.loot > 0, "member must have at least one share or one loot");
-        require(memberToKick != summoner, "the summoner may not be kicked");
         require(members[memberToKick].jailed == 0, "member must not already be jailed");
 
         bool[6] memory flags; // [sponsored, processed, didPass, cancelled, whitelist, guildkick]
@@ -257,7 +249,7 @@ contract Moloch is ReentrancyGuard {
     function sponsorProposal(uint256 proposalId) public nonReentrant onlyDelegate {
         // collect proposal deposit from sponsor and store it in the Moloch until the proposal is processed
         require(IERC20(depositToken).transferFrom(msg.sender, address(this), proposalDeposit), "proposal deposit token transfer failed");
-        addToBalance(ESCROW, depositToken, proposalDeposit);
+        unsafeAddToBalance(ESCROW, depositToken, proposalDeposit);
 
         Proposal storage proposal = proposals[proposalId];
 
@@ -382,13 +374,13 @@ contract Moloch is ReentrancyGuard {
             totalShares = totalShares.add(proposal.sharesRequested);
             totalLoot = totalLoot.add(proposal.lootRequested);
 
-            internalTransfer(ESCROW, GUILD, proposal.tributeToken, proposal.tributeOffered);
-            internalTransfer(GUILD, proposal.applicant, proposal.paymentToken, proposal.paymentRequested);
+            unsafeInternalTransfer(ESCROW, GUILD, proposal.tributeToken, proposal.tributeOffered);
+            unsafeInternalTransfer(GUILD, proposal.applicant, proposal.paymentToken, proposal.paymentRequested);
 
         // PROPOSAL FAILED
         } else {
             // return all tokens to the applicant
-            internalTransfer(ESCROW, proposal.applicant, proposal.tributeToken, proposal.tributeOffered);
+            unsafeInternalTransfer(ESCROW, proposal.applicant, proposal.tributeToken, proposal.tributeOffered);
         }
 
         _returnDeposit(proposal.sponsor);
@@ -483,8 +475,8 @@ contract Moloch is ReentrancyGuard {
     }
 
     function _returnDeposit(address sponsor) internal {
-        internalTransfer(ESCROW, msg.sender, depositToken, processingReward);
-        internalTransfer(ESCROW, sponsor, depositToken, proposalDeposit.sub(processingReward));
+        unsafeInternalTransfer(ESCROW, msg.sender, depositToken, processingReward);
+        unsafeInternalTransfer(ESCROW, sponsor, depositToken, proposalDeposit.sub(processingReward));
     }
 
     function ragequit(uint256 sharesToBurn, uint256 lootToBurn) public nonReentrant onlyMember {
@@ -511,10 +503,12 @@ contract Moloch is ReentrancyGuard {
 
         for (uint256 i = 0; i < tokens.length; i++) {
             uint256 amountToRagequit = fairShare(userTokenBalances[GUILD][tokens[i]], sharesAndLootToBurn, initialTotalSharesAndLoot);
-            // deliberately not using safemath here to keep overflows from preventing the function execution (which would break ragekicks)
-            // if a token overflows, it is because the supply was artificially inflated to oblivion, so we probably don't care about it anyways
-            userTokenBalances[GUILD][tokens[i]] -= amountToRagequit;
-            userTokenBalances[memberAddress][tokens[i]] += amountToRagequit;
+            if (amountToRagequit > 0) { // gas optimization to allow a higher maximum token limit
+                // deliberately not using safemath here to keep overflows from preventing the function execution (which would break ragekicks)
+                // if a token overflows, it is because the supply was artificially inflated to oblivion, so we probably don't care about it anyways
+                userTokenBalances[GUILD][tokens[i]] -= amountToRagequit;
+                userTokenBalances[memberAddress][tokens[i]] += amountToRagequit;
+            }
         }
 
         emit Ragequit(msg.sender, sharesToBurn, lootToBurn);
@@ -549,7 +543,7 @@ contract Moloch is ReentrancyGuard {
 
     function _withdrawBalance(address token, uint256 amount) internal {
         require(userTokenBalances[msg.sender][token] >= amount, "insufficient balance");
-        subtractFromBalance(msg.sender, token, amount);
+        unsafeSubtractFromBalance(msg.sender, token, amount);
         require(IERC20(token).transfer(msg.sender, amount), "transfer failed");
     }
 
@@ -561,7 +555,7 @@ contract Moloch is ReentrancyGuard {
 
         proposal.flags[3] = true; // cancelled
 
-        internalTransfer(ESCROW, proposal.proposer, proposal.tributeToken, proposal.tributeOffered);
+        unsafeInternalTransfer(ESCROW, proposal.proposer, proposal.tributeToken, proposal.tributeOffered);
         emit CancelProposal(proposalId, msg.sender);
     }
 
@@ -625,17 +619,17 @@ contract Moloch is ReentrancyGuard {
     /***************
     HELPER FUNCTIONS
     ***************/
-    function addToBalance(address user, address token, uint256 amount) internal {
-        userTokenBalances[user][token] = userTokenBalances[user][token].add(amount);
+    function unsafeAddToBalance(address user, address token, uint256 amount) internal {
+        userTokenBalances[user][token] += amount;
     }
 
-    function subtractFromBalance(address user, address token, uint256 amount) internal {
-        userTokenBalances[user][token] = userTokenBalances[user][token].sub(amount);
+    function unsafeSubtractFromBalance(address user, address token, uint256 amount) internal {
+        userTokenBalances[user][token] -= amount;
     }
 
-    function internalTransfer(address from, address to, address token, uint256 amount) internal {
-        subtractFromBalance(from, token, amount);
-        addToBalance(to, token, amount);
+    function unsafeInternalTransfer(address from, address to, address token, uint256 amount) internal {
+        unsafeSubtractFromBalance(from, token, amount);
+        unsafeAddToBalance(to, token, amount);
     }
 
     function fairShare(uint256 balance, uint256 shares, uint256 totalShares) internal pure returns (uint256) {
